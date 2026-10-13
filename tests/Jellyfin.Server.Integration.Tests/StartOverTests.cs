@@ -58,7 +58,7 @@ public sealed class StartOverTests : IDisposable
         var guard = exception as InvalidOperationException ?? exception.InnerException as InvalidOperationException;
         Assert.NotNull(guard);
         Assert.Contains("the database does not exist", guard.Message, StringComparison.Ordinal);
-        Assert.Empty(Directory.GetFiles(paths.DataPath, "jellyfin.db*"));
+        Assert.False(TestDatabase.Exists(_root, paths.DataPath));
         Assert.Equal(systemConfiguration, await File.ReadAllBytesAsync(paths.SystemConfigurationFilePath, TestContext.Current.CancellationToken));
     }
 
@@ -106,11 +106,7 @@ public sealed class StartOverTests : IDisposable
         // Completing the wizard through the API would queue a library scan that can still hold the database file when
         // it is deleted below, so the flag is set on the stopped server instead.
         SetWizardCompleted(paths, true);
-        SqliteConnection.ClearAllPools();
-        foreach (var file in Directory.GetFiles(paths.DataPath, "jellyfin.db*"))
-        {
-            File.Delete(file);
-        }
+        TestDatabase.Delete(_root, paths.DataPath);
 
         return paths;
     }

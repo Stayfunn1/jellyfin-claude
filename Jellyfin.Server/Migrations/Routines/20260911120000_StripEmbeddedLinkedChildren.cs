@@ -26,18 +26,27 @@ internal class StripEmbeddedLinkedChildren : IDatabaseMigrationRoutine
     {
         using var context = _dbProvider.CreateDbContext();
 
-        // json_valid guards the rare malformed blob: json_remove would abort the statement on it,
-        // and one bad row must not cost every other row the fix.
-        var updated = context.Database.ExecuteSqlRaw(
-            """
-            UPDATE "BaseItems"
-            SET "Data" = json_remove("Data", '$.LinkedChildren', '$.ExtraIds', '$.SupportsExternalTransfer')
-            WHERE "Data" IS NOT NULL
-              AND json_valid("Data") = 1
-              AND ("Data" LIKE '%"LinkedChildren"%'
-                OR "Data" LIKE '%"ExtraIds"%'
-                OR "Data" LIKE '%"SupportsExternalTransfer"%')
-            """);
+        // The validity check guards the rare malformed blob: removing keys from it would abort the
+        // statement, and one bad row must not cost every other row the fix.
+        var updated = context.Database.ExecuteSqlRaw(context.Database.IsNpgsql()
+            ? """
+                UPDATE "BaseItems"
+                SET "Data" = ("Data"::jsonb - 'LinkedChildren' - 'ExtraIds' - 'SupportsExternalTransfer')::text
+                WHERE "Data" IS NOT NULL
+                  AND pg_input_is_valid("Data", 'jsonb')
+                  AND ("Data" LIKE '%"LinkedChildren"%'
+                    OR "Data" LIKE '%"ExtraIds"%'
+                    OR "Data" LIKE '%"SupportsExternalTransfer"%')
+                """
+            : """
+                UPDATE "BaseItems"
+                SET "Data" = json_remove("Data", '$.LinkedChildren', '$.ExtraIds', '$.SupportsExternalTransfer')
+                WHERE "Data" IS NOT NULL
+                  AND json_valid("Data") = 1
+                  AND ("Data" LIKE '%"LinkedChildren"%'
+                    OR "Data" LIKE '%"ExtraIds"%'
+                    OR "Data" LIKE '%"SupportsExternalTransfer"%')
+                """);
 
         _logger.LogInformation("Dropped dead keys from the serialized data of {Count} items", updated);
     }

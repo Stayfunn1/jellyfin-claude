@@ -78,6 +78,7 @@ namespace Jellyfin.Server.Integration.Tests
             var webHostPathRoot = _webHostPathRoot;
             Directory.CreateDirectory(Path.Combine(webHostPathRoot, "logs"));
             Directory.CreateDirectory(Path.Combine(webHostPathRoot, "config"));
+            TestDatabase.Configure(webHostPathRoot);
             Directory.CreateDirectory(Path.Combine(webHostPathRoot, "cache"));
             Directory.CreateDirectory(Path.Combine(webHostPathRoot, "jellyfin-web"));
             var appPaths = new ServerApplicationPaths(

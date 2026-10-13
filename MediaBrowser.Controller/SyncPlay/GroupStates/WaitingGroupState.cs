@@ -1,6 +1,7 @@
 #nullable disable
 
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Controller.SyncPlay.PlaybackRequests;
@@ -18,9 +19,26 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
     public class WaitingGroupState : AbstractGroupState
     {
         /// <summary>
+        /// How many times a session is seeked back into position during a single wait before the
+        /// group accepts the position it reports.
+        /// </summary>
+        /// <remarks>
+        /// Players do not always land exactly where they are seeked to, e.g. a transcoded stream
+        /// restarts on a segment boundary. Correcting such a session again only reproduces the same
+        /// error, so after a few attempts the group starts anyway and leaves the remaining drift to
+        /// the clients' own sync correction.
+        /// </remarks>
+        internal const int MaxPositionCorrections = 3;
+
+        /// <summary>
         /// The logger.
         /// </summary>
         private readonly ILogger<WaitingGroupState> _logger;
+
+        /// <summary>
+        /// The number of position corrections sent to each session during the current wait.
+        /// </summary>
+        private readonly Dictionary<string, int> _positionCorrections = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Initializes a new instance of the <see cref="WaitingGroupState"/> class.
@@ -41,16 +59,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         public bool ResumePlaying { get; set; } = false;
 
         /// <summary>
-        /// Gets or sets a value indicating whether the initial state has been set.
-        /// </summary>
-        private bool InitialStateSet { get; set; } = false;
-
-        /// <summary>
-        /// Gets or sets the group state before the first ever event.
-        /// </summary>
-        private GroupStateType InitialState { get; set; }
-
-        /// <summary>
         /// Gets or sets a value indicating whether the group position moved during this wait.
         /// </summary>
         private bool PositionJumped { get; set; }
@@ -58,13 +66,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void SessionJoined(IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
             if (prevState.Equals(GroupStateType.Playing))
             {
                 ResumePlaying = true;
@@ -96,13 +97,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void SessionLeaving(IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
             context.SetBuffering(session, false);
 
             if (!context.IsBuffering())
@@ -131,32 +125,18 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(PlayGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
-            ResumePlaying = true;
-
             var setQueueStatus = context.SetPlayQueue(request.PlayingQueue, request.PlayingItemPosition, request.StartPositionTicks);
-            PositionJumped = setQueueStatus;
             if (!setQueueStatus)
             {
                 _logger.LogError("Unable to set playing queue in group {GroupId}.", context.GroupId.ToString());
 
                 // Ignore request and return to previous state.
-                IGroupState newState = prevState switch
-                {
-                    GroupStateType.Playing => new PlayingGroupState(LoggerFactory),
-                    GroupStateType.Paused => new PausedGroupState(LoggerFactory),
-                    _ => new IdleGroupState(LoggerFactory)
-                };
-
-                context.SetState(newState);
+                ReturnToPreviousState(context, prevState);
                 return;
             }
+
+            ResumePlaying = true;
+            MarkPositionJumped();
 
             var playQueueUpdate = context.GetPlayQueueUpdate(PlayQueueUpdateReason.NewPlaylist);
             var update = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
@@ -171,19 +151,12 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(SetPlaylistItemGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
-            ResumePlaying = true;
-
             var result = context.SetPlayingItem(request.PlaylistItemId);
-            PositionJumped = result;
             if (result)
             {
+                ResumePlaying = true;
+                MarkPositionJumped();
+
                 var playQueueUpdate = context.GetPlayQueueUpdate(PlayQueueUpdateReason.SetCurrentItem);
                 var update = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
                 context.SendGroupUpdate(session, SyncPlayBroadcastType.AllGroup, update, cancellationToken);
@@ -194,14 +167,7 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             else
             {
                 // Return to old state.
-                IGroupState newState = prevState switch
-                {
-                    GroupStateType.Playing => new PlayingGroupState(LoggerFactory),
-                    GroupStateType.Paused => new PausedGroupState(LoggerFactory),
-                    _ => new IdleGroupState(LoggerFactory)
-                };
-
-                context.SetState(newState);
+                ReturnToPreviousState(context, prevState);
 
                 _logger.LogDebug("Unable to change current playing item in group {GroupId}.", context.GroupId.ToString());
             }
@@ -210,18 +176,11 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(UnpauseGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
             if (prevState.Equals(GroupStateType.Idle))
             {
                 ResumePlaying = true;
                 context.RestartCurrentItem();
-                PositionJumped = true;
+                MarkPositionJumped();
 
                 var playQueueUpdate = context.GetPlayQueueUpdate(PlayQueueUpdateReason.NewPlaylist);
                 var update = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
@@ -263,13 +222,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(PauseGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
             // Wait for sessions to be ready, then switch to paused state.
             ResumePlaying = false;
 
@@ -280,13 +232,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(StopGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
             // Change state.
             var idleState = new IdleGroupState(LoggerFactory);
             context.SetState(idleState);
@@ -296,13 +241,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(SeekGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
             if (prevState.Equals(GroupStateType.Playing))
             {
                 ResumePlaying = true;
@@ -318,7 +256,7 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             // Seek.
             context.PositionTicks = ticks;
             context.LastActivity = DateTime.UtcNow;
-            PositionJumped = true;
+            MarkPositionJumped();
 
             var command = context.NewSyncPlayCommand(SendCommandType.Seek);
             context.SendCommand(session, SyncPlayBroadcastType.AllGroup, command, cancellationToken);
@@ -333,13 +271,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(BufferGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
             // Make sure the client is playing the correct item.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
@@ -348,6 +279,18 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 var playQueueUpdate = context.GetPlayQueueUpdate(PlayQueueUpdateReason.SetCurrentItem);
                 var updateSession = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
                 context.SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, updateSession, cancellationToken);
+
+                if (prevState is GroupStateType.Playing or GroupStateType.Paused)
+                {
+                    // The report is about an item the group already moved past, e.g. it raced a
+                    // next-item request. The rest of the group is not affected by it: holding them
+                    // back here would leave them playing while the group believes it is paused,
+                    // with a position that stopped advancing. The session catches up from the
+                    // update above like a member that was just told to change item.
+                    ReturnToPreviousState(context, prevState);
+                    return;
+                }
+
                 context.SetBuffering(session, true);
 
                 return;
@@ -407,13 +350,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(ReadyGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
             // Make sure the client is playing the correct item.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
@@ -467,18 +403,15 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                 if (Math.Abs(delayTicks) > maxOffsetTicks)
                 {
-                    // Session not ready at all.
-                    context.SetBuffering(session, true);
+                    if (TryCorrectPosition(context, request, session, cancellationToken))
+                    {
+                        _logger.LogWarning("Session {SessionId} got lost in time, correcting.", session.Id);
+                        return;
+                    }
 
-                    // Correcting session's position.
-                    var command = context.NewSyncPlayCommand(SendCommandType.Seek);
-                    context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
-
-                    // Notify relevant state change event.
-                    SendGroupStateUpdate(context, request, session, cancellationToken);
-
-                    _logger.LogWarning("Session {SessionId} got lost in time, correcting.", session.Id);
-                    return;
+                    // The session cannot get any closer, so the group starts from its own position
+                    // and the session's player syncs up once playback is running.
+                    delayTicks = 0;
                 }
 
                 // Session is ready.
@@ -535,17 +468,9 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             else
             {
                 // Check that session is really ready, tolerate player imperfections under a certain threshold.
-                if (Math.Abs(context.PositionTicks - requestTicks) > maxPlaybackOffsetTicks)
+                if (Math.Abs(context.PositionTicks - requestTicks) > maxPlaybackOffsetTicks
+                    && TryCorrectPosition(context, request, session, cancellationToken))
                 {
-                    // Session still not ready.
-                    context.SetBuffering(session, true);
-                    // Session is seeking to wrong position, correcting.
-                    var command = context.NewSyncPlayCommand(SendCommandType.Seek);
-                    context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
-
-                    // Notify relevant state change event.
-                    SendGroupStateUpdate(context, request, session, cancellationToken);
-
                     _logger.LogWarning("Session {SessionId} is seeking to wrong position, correcting.", session.Id);
                     return;
                 }
@@ -558,19 +483,13 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     _logger.LogDebug("Session {SessionId} is ready, group {GroupId} is ready.", session.Id, context.GroupId.ToString());
 
                     // Group is ready, returning to previous state.
+                    // The group has been paused for the whole wait, whichever state it came from: the
+                    // position was frozen when the wait started, or set by the request that started it,
+                    // and every member was checked against it above. Everyone is told where the group
+                    // stands, including the members that never had to wait.
                     var pausedState = new PausedGroupState(LoggerFactory);
                     context.SetState(pausedState);
-
-                    if (InitialState.Equals(GroupStateType.Playing))
-                    {
-                        // Group went from playing to waiting state and a pause request occurred while waiting.
-                        var pauseRequest = new PauseGroupRequest();
-                        pausedState.HandleRequest(pauseRequest, context, Type, session, cancellationToken);
-                    }
-                    else if (InitialState.Equals(GroupStateType.Paused))
-                    {
-                        pausedState.HandleRequest(request, context, Type, session, cancellationToken);
-                    }
+                    pausedState.HandleRequest(request, context, Type, session, cancellationToken);
                 }
             }
         }
@@ -578,26 +497,22 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(NextItemGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
-            ResumePlaying = true;
-
             // Make sure the client knows the playing item, to avoid duplicate requests.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
                 _logger.LogDebug("Session {SessionId} provided the wrong playlist item for group {GroupId}.", session.Id, context.GroupId.ToString());
+
+                // The request is a duplicate, so the group carries on with what it was doing.
+                ReturnToPreviousState(context, prevState);
                 return;
             }
 
             var newItem = context.NextItemInQueue();
-            PositionJumped = newItem;
             if (newItem)
             {
+                ResumePlaying = true;
+                MarkPositionJumped();
+
                 // Send playing-queue update.
                 var playQueueUpdate = context.GetPlayQueueUpdate(PlayQueueUpdateReason.NextItem);
                 var update = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
@@ -609,14 +524,7 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             else
             {
                 // Return to old state.
-                IGroupState newState = prevState switch
-                {
-                    GroupStateType.Playing => new PlayingGroupState(LoggerFactory),
-                    GroupStateType.Paused => new PausedGroupState(LoggerFactory),
-                    _ => new IdleGroupState(LoggerFactory)
-                };
-
-                context.SetState(newState);
+                ReturnToPreviousState(context, prevState);
 
                 _logger.LogDebug("No next item available in group {GroupId}.", context.GroupId.ToString());
             }
@@ -625,26 +533,22 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// <inheritdoc />
         public override void HandleRequest(PreviousItemGroupRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
-            // Save state if first event.
-            if (!InitialStateSet)
-            {
-                InitialState = prevState;
-                InitialStateSet = true;
-            }
-
-            ResumePlaying = true;
-
             // Make sure the client knows the playing item, to avoid duplicate requests.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
                 _logger.LogDebug("Session {SessionId} provided the wrong playlist item for group {GroupId}.", session.Id, context.GroupId.ToString());
+
+                // The request is a duplicate, so the group carries on with what it was doing.
+                ReturnToPreviousState(context, prevState);
                 return;
             }
 
             var newItem = context.PreviousItemInQueue();
-            PositionJumped = newItem;
             if (newItem)
             {
+                ResumePlaying = true;
+                MarkPositionJumped();
+
                 // Send playing-queue update.
                 var playQueueUpdate = context.GetPlayQueueUpdate(PlayQueueUpdateReason.PreviousItem);
                 var update = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
@@ -656,14 +560,7 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             else
             {
                 // Return to old state.
-                IGroupState newState = prevState switch
-                {
-                    GroupStateType.Playing => new PlayingGroupState(LoggerFactory),
-                    GroupStateType.Paused => new PausedGroupState(LoggerFactory),
-                    _ => new IdleGroupState(LoggerFactory)
-                };
-
-                context.SetState(newState);
+                ReturnToPreviousState(context, prevState);
 
                 _logger.LogDebug("No previous item available in group {GroupId}.", context.GroupId.ToString());
             }
@@ -693,6 +590,73 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     context.SetState(pausedState);
                 }
             }
+        }
+
+        /// <summary>
+        /// Puts the group back in the state it was in before a request that turned out to change nothing.
+        /// </summary>
+        /// <param name="context">The context of the state.</param>
+        /// <param name="prevState">The state the group was in before the request.</param>
+        private void ReturnToPreviousState(IGroupStateContext context, GroupStateType prevState)
+        {
+            IGroupState newState = prevState switch
+            {
+                GroupStateType.Playing => new PlayingGroupState(LoggerFactory),
+                GroupStateType.Paused => new PausedGroupState(LoggerFactory),
+                GroupStateType.Idle => new IdleGroupState(LoggerFactory),
+                // The group was already waiting, and still is: the members it waits for are unchanged.
+                _ => null
+            };
+
+            if (newState is not null)
+            {
+                context.SetState(newState);
+            }
+        }
+
+        /// <summary>
+        /// Records that the group position moved, which starts a new round of position checks.
+        /// </summary>
+        private void MarkPositionJumped()
+        {
+            PositionJumped = true;
+            _positionCorrections.Clear();
+        }
+
+        /// <summary>
+        /// Seeks a session that reported ready at the wrong position back to the group position,
+        /// unless it has already been corrected <see cref="MaxPositionCorrections"/> times during this wait.
+        /// </summary>
+        /// <param name="context">The context of the state.</param>
+        /// <param name="request">The ready request with the wrong position.</param>
+        /// <param name="session">The session.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        /// <returns><c>true</c> if a correction was sent; <c>false</c> if the session's position has to be accepted.</returns>
+        private bool TryCorrectPosition(IGroupStateContext context, ReadyGroupRequest request, SessionInfo session, CancellationToken cancellationToken)
+        {
+            _positionCorrections.TryGetValue(session.Id, out var corrections);
+            if (corrections >= MaxPositionCorrections)
+            {
+                _logger.LogWarning(
+                    "Session {SessionId} is still off position in group {GroupId} after {Corrections} corrections, accepting it.",
+                    session.Id,
+                    context.GroupId.ToString(),
+                    corrections);
+                return false;
+            }
+
+            _positionCorrections[session.Id] = corrections + 1;
+
+            // Session not ready at all.
+            context.SetBuffering(session, true);
+
+            // Correcting session's position.
+            var command = context.NewSyncPlayCommand(SendCommandType.Seek);
+            context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
+
+            // Notify relevant state change event.
+            SendGroupStateUpdate(context, request, session, cancellationToken);
+            return true;
         }
     }
 }

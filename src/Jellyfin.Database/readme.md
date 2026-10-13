@@ -2,23 +2,22 @@
 
 This shall provide context on how to work with entity frameworks multi provider migration feature.
 
-Jellyfin will support multiple database providers in the future, namely SQLite as its default and the experimental PostgreSQL.
+Jellyfin supports multiple database providers: SQLite as its default, and PostgreSQL (see [docs/postgresql.md](../../docs/postgresql.md)).
 
 Each provider has its own set of migrations, as they contain provider specific instructions to migrate the specific changes to their respective systems.
 
-When creating a new migration, you always have to create migrations for all providers. This is supported via the following syntax:
+When creating a new migration, you always have to create migrations for all providers. Run the Entity Framework tool once per provider project; each project has a design time factory that builds the model with that provider's conventions, so no database is needed.
+
+The examples are made from the root folder of the project e.g for codespaces `/workspaces/jellyfin`
 
 ```cmd
-dotnet ef migrations add MIGRATION_NAME --project "PATH_TO_PROJECT" -- --provider PROVIDER_KEY
+dotnet ef migrations add {MIGRATION_NAME} --project "src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite" --output-dir Migrations
+dotnet ef migrations add {MIGRATION_NAME} --project "src/Jellyfin.Database/Jellyfin.Database.Providers.Postgres" --output-dir Migrations
 ```
 
-with SQLite currently being the only supported provider, you need to run the Entity Framework tool with the correct project to tell EFCore where to store the migrations and the correct provider key to tell Jellyfin to load that provider.
+SQL that a migration runs by hand (`migrationBuilder.Sql`) is provider specific and has to be written for each provider. The PostgreSQL `InitialCreate` migration also creates two things that are not part of the model: the `min`/`max` aggregates for `uuid` used by the item grouping queries, and the `IX_Peoples_NameLower` expression index.
 
-The example is made from the root folder of the project e.g for codespaces `/workspaces/jellyfin`
-
-```cmd
-dotnet ef migrations add {MIGRATION_NAME} --project "src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite" --output-dir Migrations -- --migration-provider Jellyfin-SQLite
-```
+To check a PostgreSQL migration against a real server, run the tests with `JELLYFIN_TEST_POSTGRES` set, see [docs/postgresql.md](../../docs/postgresql.md#for-developers).
 
 If you get the error: `Run "dotnet tool restore" to make the "dotnet-ef" command available.` Run `dotnet restore`.
 

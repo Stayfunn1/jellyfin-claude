@@ -6,6 +6,7 @@ using System.Reflection;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Implementations.Locking;
+using Jellyfin.Database.Providers.Postgres;
 using Jellyfin.Database.Providers.Sqlite;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
@@ -21,9 +22,14 @@ namespace Jellyfin.Server.Implementations.Extensions;
 /// </summary>
 public static class ServiceCollectionExtensions
 {
-    private static IEnumerable<Type> DatabaseProviderTypes()
+    /// <summary>
+    /// Gets the database providers that ship with jellyfin.
+    /// </summary>
+    /// <returns>The provider types.</returns>
+    internal static IEnumerable<Type> DatabaseProviderTypes()
     {
         yield return typeof(SqliteDatabaseProvider);
+        yield return typeof(PostgresDatabaseProvider);
     }
 
     private static IDictionary<string, JellyfinDbProviderFactory> GetSupportedDbProviders()

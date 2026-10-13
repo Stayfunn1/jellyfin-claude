@@ -30,6 +30,8 @@ public sealed class SqliteDatabaseStatisticsTests : SqliteDbTestFixture
     [Fact]
     public async Task RunScheduledOptimisation_EmptyLibrary_RecordsNoStatistics()
     {
+        Assert.SkipWhen(IsPostgres, "Checks the statistics tables of SQLite.");
+
         SeedFolders(3);
 
         await _provider.RunScheduledOptimisation(CancellationToken.None);
@@ -40,6 +42,8 @@ public sealed class SqliteDatabaseStatisticsTests : SqliteDbTestFixture
     [Fact]
     public async Task RunScheduledOptimisation_LibraryWithItems_RecordsStatistics()
     {
+        Assert.SkipWhen(IsPostgres, "Checks the statistics tables of SQLite.");
+
         SeedFolders(1);
         SeedEpisodes(4);
 
@@ -51,6 +55,8 @@ public sealed class SqliteDatabaseStatisticsTests : SqliteDbTestFixture
     [Fact]
     public async Task RefreshStatistics_NoStatistics_Analyzes()
     {
+        Assert.SkipWhen(IsPostgres, "Checks the statistics tables of SQLite.");
+
         SeedEpisodes(5);
 
         await _provider.RefreshStatistics(CancellationToken.None);
@@ -61,6 +67,8 @@ public sealed class SqliteDatabaseStatisticsTests : SqliteDbTestFixture
     [Fact]
     public async Task RefreshStatistics_LibraryChanged_Reanalyzes()
     {
+        Assert.SkipWhen(IsPostgres, "Checks the statistics tables of SQLite.");
+
         SeedEpisodes(10);
         Analyze();
         SeedEpisodes(5);
@@ -73,6 +81,8 @@ public sealed class SqliteDatabaseStatisticsTests : SqliteDbTestFixture
     [Fact]
     public async Task RefreshStatistics_EmptyLibrary_RecordsNoStatistics()
     {
+        Assert.SkipWhen(IsPostgres, "Checks the statistics tables of SQLite.");
+
         SeedFolders(2);
 
         await _provider.RefreshStatistics(CancellationToken.None);
