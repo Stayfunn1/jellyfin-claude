@@ -43,3 +43,35 @@ jobs:
 
       # TODO - which action / tool to use to publish code coverage results?
       # - name: Publish code coverage results
+
+  run-tests-postgres:
+    # The database tests again, against PostgreSQL instead of SQLite.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: jellyfin
+          POSTGRES_PASSWORD: jellyfin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jellyfin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      JELLYFIN_TEST_POSTGRES: "Host=localhost;Port=5432;Username=jellyfin;Password=jellyfin"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Run database tests on PostgreSQL
+        run: |
+          dotnet test tests/Jellyfin.Server.Implementations.Tests --configuration Release --verbosity minimal
+          dotnet test tests/Jellyfin.Server.Integration.Tests --configuration Release --verbosity minimal
