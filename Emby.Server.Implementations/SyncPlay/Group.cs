@@ -263,16 +263,100 @@ namespace Emby.Server.Implementations.SyncPlay
                 return true;
             }
 
-            // Get list of users.
-            var users = _participants
-                .Values
-                .Select(participant => _userManager.GetUserById(participant.UserId));
-
             // Find problematic users.
-            var usersWithNoAccess = users.Where(user => !HasAccessToQueue(user, queue));
+            var usersWithNoAccess = _participants
+                .Values
+                .Select(participant => participant.UserId)
+                .Distinct()
+                .Select(userId => _userManager.GetUserById(userId))
+                .Where(user => user is null || !HasAccessToQueue(user, queue))
+                .Select(user => user?.Username ?? "<deleted user>")
+                .ToList();
+
+            if (usersWithNoAccess.Count > 0)
+            {
+                // Without this the request is simply dropped, which looks to the group like SyncPlay
+                // ignoring them. Say who is in the way so an administrator can grant the access.
+                _logger.LogWarning(
+                    "Group {GroupId} cannot play the requested items: user(s) {Users} cannot access all of them. Check their library access and parental control settings.",
+                    GroupId.ToString(),
+                    string.Join(", ", usersWithNoAccess));
+                return false;
+            }
 
             // All users must be able to access the queue.
-            return !usersWithNoAccess.Any();
+            return true;
+        }
+
+        /// <summary>
+        /// Gets the runtime of a library item, or 0 when it is unknown or the item no longer exists.
+        /// </summary>
+        /// <param name="itemId">The item identifier.</param>
+        /// <returns>The runtime ticks of the item.</returns>
+        private long GetItemRunTimeTicks(Guid itemId)
+        {
+            if (itemId.IsEmpty())
+            {
+                return 0;
+            }
+
+            // Items can be removed from the library while they sit in a group's queue.
+            return _libraryManager.GetItemById(itemId)?.RunTimeTicks ?? 0;
+        }
+
+        /// <summary>
+        /// Builds a play queue from what a session is currently playing.
+        /// </summary>
+        /// <param name="session">The session.</param>
+        /// <returns>The play queue, which always contains the session's playing item.</returns>
+        private static List<Guid> GetSessionPlayQueue(SessionInfo session)
+        {
+            var playingItemId = session.FullNowPlayingItem.Id;
+            var playlist = session.NowPlayingQueue?.Select(item => item.Id).ToList() ?? [];
+
+            // Not every client reports its queue, and the ones that do may report it out of step with
+            // the playing item. A queue without the playing item would leave the group with nothing to play.
+            if (!playlist.Contains(playingItemId))
+            {
+                playlist = [playingItemId];
+            }
+
+            return playlist;
+        }
+
+        /// <summary>
+        /// Makes what a session is currently playing the group's playback, so the group continues from
+        /// there instead of stopping the session.
+        /// </summary>
+        /// <param name="session">The session that is playing.</param>
+        /// <returns><c>true</c> if the group took over the session's playback; <c>false</c> otherwise.</returns>
+        private bool TryAdoptSessionPlayback(SessionInfo session)
+        {
+            if (session.FullNowPlayingItem is null)
+            {
+                return false;
+            }
+
+            var playlist = GetSessionPlayQueue(session);
+            if (!AllUsersHaveAccessToQueue(playlist))
+            {
+                return false;
+            }
+
+            PlayQueue.Reset();
+            PlayQueue.SetPlaylist(playlist);
+            PlayQueue.SetPlayingItemById(session.FullNowPlayingItem.Id);
+            RunTimeTicks = session.FullNowPlayingItem.RunTimeTicks ?? GetItemRunTimeTicks(session.FullNowPlayingItem.Id);
+            PositionTicks = SanitizePositionTicks(session.PlayState?.PositionTicks);
+            LastActivity = DateTime.UtcNow;
+
+            // Maintain playstate.
+            var waitingState = new WaitingGroupState(_loggerFactory)
+            {
+                ResumePlaying = session.PlayState is null || !session.PlayState.IsPaused
+            };
+            SetState(waitingState);
+            return true;
         }
 
         /// <summary>
@@ -292,26 +376,10 @@ namespace Emby.Server.Implementations.SyncPlay
             GroupName = request.GroupName;
             AddSession(session);
 
-            var sessionIsPlayingAnItem = session.FullNowPlayingItem is not null;
-
             RestartCurrentItem();
 
-            if (sessionIsPlayingAnItem)
-            {
-                var playlist = session.NowPlayingQueue.Select(item => item.Id).ToList();
-                PlayQueue.Reset();
-                PlayQueue.SetPlaylist(playlist);
-                PlayQueue.SetPlayingItemById(session.FullNowPlayingItem.Id);
-                RunTimeTicks = session.FullNowPlayingItem.RunTimeTicks ?? 0;
-                PositionTicks = session.PlayState.PositionTicks ?? 0;
-
-                // Maintain playstate.
-                var waitingState = new WaitingGroupState(_loggerFactory)
-                {
-                    ResumePlaying = !session.PlayState.IsPaused
-                };
-                SetState(waitingState);
-            }
+            // A session that is already watching something brings it into the group.
+            TryAdoptSessionPlayback(session);
 
             var updateSession = new SyncPlayGroupJoinedUpdate(GroupId, GetInfo());
             SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, updateSession, cancellationToken);
@@ -331,11 +399,30 @@ namespace Emby.Server.Implementations.SyncPlay
         {
             AddSession(session);
 
+            // When the group has nothing to play, a session that joins while watching something
+            // brings it along, exactly as if it had created the group. Joining before or after
+            // starting playback then works the same, instead of the joiner's playback being stopped.
+            var adoptedPlayback = _state.Type == GroupStateType.Idle
+                && !PlayQueue.IsItemPlaying()
+                && TryAdoptSessionPlayback(session);
+
             var updateSession = new SyncPlayGroupJoinedUpdate(GroupId, GetInfo());
             SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, updateSession, cancellationToken);
 
             var updateOthers = new SyncPlayUserJoinedUpdate(GroupId, session.UserName);
             SendGroupUpdate(session, SyncPlayBroadcastType.AllExceptCurrentSession, updateOthers, cancellationToken);
+
+            if (adoptedPlayback)
+            {
+                // Every member has to load the new queue, not only the one that joined.
+                var playQueueUpdate = GetPlayQueueUpdate(PlayQueueUpdateReason.NewPlaylist);
+                var update = new SyncPlayPlayQueueUpdate(GroupId, playQueueUpdate);
+                SendGroupUpdate(session, SyncPlayBroadcastType.AllGroup, update, cancellationToken);
+                SetAllBuffering(true);
+
+                _logger.LogInformation("Session {SessionId} joined group {GroupId} and the group took over its playback.", session.Id, GroupId.ToString());
+                return;
+            }
 
             _state.SessionJoined(this, _state.Type, session, cancellationToken);
 
@@ -475,8 +562,11 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <inheritdoc />
         public long SanitizePositionTicks(long? positionTicks)
         {
-            var ticks = positionTicks ?? 0;
-            return Math.Clamp(ticks, 0, RunTimeTicks);
+            var ticks = Math.Max(positionTicks ?? 0, 0);
+
+            // Items that have not been probed yet, live streams and some remote media have no known
+            // runtime. Clamping to it would send every seek and every reported position to the start.
+            return RunTimeTicks > 0 ? Math.Min(ticks, RunTimeTicks) : ticks;
         }
 
         /// <inheritdoc />
@@ -557,9 +647,8 @@ namespace Emby.Server.Implementations.SyncPlay
             PlayQueue.Reset();
             PlayQueue.SetPlaylist(playQueue);
             PlayQueue.SetPlayingItemByIndex(playingItemPosition);
-            var item = _libraryManager.GetItemById(PlayQueue.GetPlayingItemId());
-            RunTimeTicks = item.RunTimeTicks ?? 0;
-            PositionTicks = startPositionTicks;
+            RunTimeTicks = GetItemRunTimeTicks(PlayQueue.GetPlayingItemId());
+            PositionTicks = SanitizePositionTicks(startPositionTicks);
             LastActivity = DateTime.UtcNow;
 
             return true;
@@ -570,15 +659,7 @@ namespace Emby.Server.Implementations.SyncPlay
         {
             var itemFound = PlayQueue.SetPlayingItemByPlaylistId(playlistItemId);
 
-            if (itemFound)
-            {
-                var item = _libraryManager.GetItemById(PlayQueue.GetPlayingItemId());
-                RunTimeTicks = item.RunTimeTicks ?? 0;
-            }
-            else
-            {
-                RunTimeTicks = 0;
-            }
+            RunTimeTicks = itemFound ? GetItemRunTimeTicks(PlayQueue.GetPlayingItemId()) : 0;
 
             RestartCurrentItem();
 
@@ -601,17 +682,7 @@ namespace Emby.Server.Implementations.SyncPlay
             var playingItemRemoved = PlayQueue.RemoveFromPlaylist(playlistItemIds);
             if (playingItemRemoved)
             {
-                var itemId = PlayQueue.GetPlayingItemId();
-                if (!itemId.IsEmpty())
-                {
-                    var item = _libraryManager.GetItemById(itemId);
-                    RunTimeTicks = item.RunTimeTicks ?? 0;
-                }
-                else
-                {
-                    RunTimeTicks = 0;
-                }
-
+                RunTimeTicks = GetItemRunTimeTicks(PlayQueue.GetPlayingItemId());
                 RestartCurrentItem();
             }
 
@@ -664,8 +735,7 @@ namespace Emby.Server.Implementations.SyncPlay
             var update = PlayQueue.Next();
             if (update)
             {
-                var item = _libraryManager.GetItemById(PlayQueue.GetPlayingItemId());
-                RunTimeTicks = item.RunTimeTicks ?? 0;
+                RunTimeTicks = GetItemRunTimeTicks(PlayQueue.GetPlayingItemId());
                 RestartCurrentItem();
                 return true;
             }
@@ -679,8 +749,7 @@ namespace Emby.Server.Implementations.SyncPlay
             var update = PlayQueue.Previous();
             if (update)
             {
-                var item = _libraryManager.GetItemById(PlayQueue.GetPlayingItemId());
-                RunTimeTicks = item.RunTimeTicks ?? 0;
+                RunTimeTicks = GetItemRunTimeTicks(PlayQueue.GetPlayingItemId());
                 RestartCurrentItem();
                 return true;
             }

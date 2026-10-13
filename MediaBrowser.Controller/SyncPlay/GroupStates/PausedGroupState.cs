@@ -69,15 +69,21 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             {
                 // Pause group and compute the media playback position.
                 var currentTime = DateTime.UtcNow;
-                var elapsedTime = currentTime - context.LastActivity;
+                if (prevState.Equals(GroupStateType.Playing))
+                {
+                    var elapsedTime = currentTime - context.LastActivity;
+                    // Elapsed time is negative if event happens
+                    // during the delay added to account for latency.
+                    // In this phase clients haven't started the playback yet.
+                    // In other words, LastActivity is in the future,
+                    // when playback unpause is supposed to happen.
+                    // Seek only if playback actually started.
+                    // Only a playing group has a position that moved on since LastActivity, a
+                    // waiting group stood still at PositionTicks the whole time.
+                    context.PositionTicks += Math.Max(elapsedTime.Ticks, 0);
+                }
+
                 context.LastActivity = currentTime;
-                // Elapsed time is negative if event happens
-                // during the delay added to account for latency.
-                // In this phase clients haven't started the playback yet.
-                // In other words, LastActivity is in the future,
-                // when playback unpause is supposed to happen.
-                // Seek only if playback actually started.
-                context.PositionTicks += Math.Max(elapsedTime.Ticks, 0);
 
                 var command = context.NewSyncPlayCommand(SendCommandType.Pause);
                 context.SendCommand(session, SyncPlayBroadcastType.AllGroup, command, cancellationToken);

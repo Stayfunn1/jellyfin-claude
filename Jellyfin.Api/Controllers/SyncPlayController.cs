@@ -16,6 +16,7 @@ using MediaBrowser.Model.SyncPlay;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Api.Controllers;
 
@@ -25,9 +26,17 @@ namespace Jellyfin.Api.Controllers;
 [Authorize(Policy = Policies.SyncPlayHasAccess)]
 public class SyncPlayController : BaseJellyfinApiController
 {
+    /// <summary>
+    /// The reason given to a client that tries to use SyncPlay without a WebSocket connection.
+    /// </summary>
+    internal const string NoWebSocketMessage =
+        "SyncPlay needs a WebSocket connection between this client and the server, and this client has none. "
+        + "If the server is behind a reverse proxy, make sure the proxy forwards WebSocket connections (the /socket endpoint).";
+
     private readonly ISessionManager _sessionManager;
     private readonly ISyncPlayManager _syncPlayManager;
     private readonly IUserManager _userManager;
+    private readonly ILogger<SyncPlayController> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SyncPlayController"/> class.
@@ -35,14 +44,17 @@ public class SyncPlayController : BaseJellyfinApiController
     /// <param name="sessionManager">Instance of the <see cref="ISessionManager"/> interface.</param>
     /// <param name="syncPlayManager">Instance of the <see cref="ISyncPlayManager"/> interface.</param>
     /// <param name="userManager">Instance of the <see cref="IUserManager"/> interface.</param>
+    /// <param name="logger">Instance of the <see cref="ILogger{SyncPlayController}"/> interface.</param>
     public SyncPlayController(
         ISessionManager sessionManager,
         ISyncPlayManager syncPlayManager,
-        IUserManager userManager)
+        IUserManager userManager,
+        ILogger<SyncPlayController> logger)
     {
         _sessionManager = sessionManager;
         _syncPlayManager = syncPlayManager;
         _userManager = userManager;
+        _logger = logger;
     }
 
     /// <summary>
@@ -50,14 +62,21 @@ public class SyncPlayController : BaseJellyfinApiController
     /// </summary>
     /// <param name="requestData">The settings of the new group.</param>
     /// <response code="204">New group created.</response>
+    /// <response code="400">The client has no WebSocket connection, so it cannot take part in SyncPlay.</response>
     /// <returns>An <see cref="GroupInfoDto"/> for the created group.</returns>
     [HttpPost("New")]
     [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [Authorize(Policy = Policies.SyncPlayCreateGroup)]
     public async Task<ActionResult<GroupInfoDto>> SyncPlayCreateGroup(
         [FromBody, Required] NewGroupRequestDto requestData)
     {
         var currentSession = await RequestHelpers.GetSession(_sessionManager, _userManager, HttpContext).ConfigureAwait(false);
+        if (!CanReceiveSyncPlayMessages(currentSession))
+        {
+            return BadRequest(NoWebSocketMessage);
+        }
+
         var syncPlayRequest = new NewGroupRequest(requestData.GroupName.Trim());
         return Ok(_syncPlayManager.NewGroup(currentSession, syncPlayRequest, CancellationToken.None));
     }
@@ -67,14 +86,21 @@ public class SyncPlayController : BaseJellyfinApiController
     /// </summary>
     /// <param name="requestData">The group to join.</param>
     /// <response code="204">Group join successful.</response>
+    /// <response code="400">The client has no WebSocket connection, so it cannot take part in SyncPlay.</response>
     /// <returns>A <see cref="NoContentResult"/> indicating success.</returns>
     [HttpPost("Join")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [Authorize(Policy = Policies.SyncPlayJoinGroup)]
     public async Task<ActionResult> SyncPlayJoinGroup(
         [FromBody, Required] JoinGroupRequestDto requestData)
     {
         var currentSession = await RequestHelpers.GetSession(_sessionManager, _userManager, HttpContext).ConfigureAwait(false);
+        if (!CanReceiveSyncPlayMessages(currentSession))
+        {
+            return BadRequest(NoWebSocketMessage);
+        }
+
         var syncPlayRequest = new JoinGroupRequest(requestData.GroupId);
         _syncPlayManager.JoinGroup(currentSession, syncPlayRequest, CancellationToken.None);
         return NoContent();
@@ -436,5 +462,28 @@ public class SyncPlayController : BaseJellyfinApiController
         var syncPlayRequest = new PingGroupRequest(requestData.Ping);
         _syncPlayManager.HandleRequest(currentSession, syncPlayRequest, CancellationToken.None);
         return NoContent();
+    }
+
+    /// <summary>
+    /// Checks whether the server can push SyncPlay commands to a session.
+    /// </summary>
+    /// <param name="session">The session.</param>
+    /// <returns><c>true</c> if the session has a live connection the server can push to; <c>false</c> otherwise.</returns>
+    private bool CanReceiveSyncPlayMessages(SessionInfo session)
+    {
+        // Every SyncPlay command and group update is pushed over the session's WebSocket. Without one
+        // the client would join, never hear from the group again, and hold everyone else up while the
+        // group waits for it to report ready.
+        if (session.SessionControllers.Any(controller => controller.IsSessionActive))
+        {
+            return true;
+        }
+
+        _logger.LogWarning(
+            "Refusing SyncPlay for session {SessionId} ({Client} on {DeviceName}): it has no open WebSocket connection. If Jellyfin is behind a reverse proxy, make sure the proxy forwards WebSocket connections.",
+            session.Id,
+            session.Client,
+            session.DeviceName);
+        return false;
     }
 }
