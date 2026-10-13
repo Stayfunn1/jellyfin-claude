@@ -52,6 +52,11 @@ Check out our <a href="https://translate.jellyfin.org">Weblate instance</a> to h
 
 This repository contains the code for Jellyfin's backend server. Note that this is only one of many projects under the Jellyfin GitHub [organization](https://github.com/jellyfin/) on GitHub. If you want to contribute, you can start by checking out our [documentation](https://jellyfin.org/docs/general/contributing/index.html) to see what to work on.
 
+Guides for this build:
+
+- [Running Jellyfin on PostgreSQL](docs/postgresql.md): using a PostgreSQL server instead of SQLite, and moving an existing server over.
+- [SyncPlay: watching together](docs/syncplay.md): how it works, when to turn it on, and what to check when it does not work.
+
 ## Server Development
 
 These instructions will help you get set up with a local development environment in order to contribute to this repository. Before you start, please be sure to completely read our [guidelines on development contributions](https://jellyfin.org/docs/general/contributing/development.html). Note that this project is supported on all major operating systems except FreeBSD, which is still incompatible.
