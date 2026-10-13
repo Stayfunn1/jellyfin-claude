@@ -24,13 +24,21 @@ public sealed class PostgresTestDatabase : IDisposable
     private readonly string _name;
 
     public PostgresTestDatabase()
+        : this(create: true)
+    {
+    }
+
+    private PostgresTestDatabase(bool create)
     {
         _name = "jellyfin_test_" + Guid.NewGuid().ToString("N");
 
-        // CREATE DATABASE ... TEMPLATE fails while another session copies the same template.
-        lock (_createLock)
+        if (create)
         {
-            ExecuteOnServer($"CREATE DATABASE \"{_name}\" TEMPLATE \"{_template.Value}\"");
+            // CREATE DATABASE ... TEMPLATE fails while another session copies the same template.
+            lock (_createLock)
+            {
+                ExecuteOnServer($"CREATE DATABASE \"{_name}\" TEMPLATE \"{_template.Value}\"");
+            }
         }
 
         Configuration = CreateConfiguration(_name);
@@ -45,6 +53,12 @@ public sealed class PostgresTestDatabase : IDisposable
     /// Gets the database.xml configuration that points to this database.
     /// </summary>
     public DatabaseConfigurationOptions Configuration { get; }
+
+    /// <summary>
+    /// Gets a database that does not exist yet, for tests of what creates it. It is dropped like any other.
+    /// </summary>
+    /// <returns>The database.</returns>
+    public static PostgresTestDatabase NotYetCreated() => new(create: false);
 
     public void Dispose()
     {
@@ -105,7 +119,9 @@ public sealed class PostgresTestDatabase : IDisposable
         using var connection = new NpgsqlConnection(server.ConnectionString);
         connection.Open();
         using var command = connection.CreateCommand();
+#pragma warning disable CA2100 // Database names cannot be parameters; the test generates them.
         command.CommandText = sql;
+#pragma warning restore CA2100
         command.ExecuteNonQuery();
     }
 }

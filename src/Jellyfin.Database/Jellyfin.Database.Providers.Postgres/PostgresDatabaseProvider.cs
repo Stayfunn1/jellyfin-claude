@@ -34,7 +34,7 @@ public sealed class PostgresDatabaseProvider : IJellyfinDatabaseProvider
     private const string BackupDatabaseInfix = "_backup_";
 
     // Stateless, and shared so every context options instance resolves to the same EF Core service provider.
-    private static readonly IInterceptor[] _interceptors = [new CaseInsensitiveLikeInterceptor(), new NulCharacterSaveChangesInterceptor()];
+    private static readonly IInterceptor[] _interceptors = [new CaseInsensitiveLikeInterceptor(), new NulCharacterSaveChangesInterceptor(), new WriteTransactionLockInterceptor()];
 
     private readonly ILogger<PostgresDatabaseProvider> _logger;
     private NpgsqlConnectionStringBuilder? _connectionString;
@@ -177,10 +177,20 @@ public sealed class PostgresDatabaseProvider : IJellyfinDatabaseProvider
         await using (connection.ConfigureAwait(false))
         {
             _logger.LogInformation("Copying database {Database} to {BackupDatabase} before migrating", database, backupDatabase);
-            await ExecuteAsync(
-                connection,
-                $"CREATE DATABASE {QuoteIdentifier(backupDatabase)} WITH TEMPLATE {QuoteIdentifier(database)}",
-                cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await ExecuteAsync(
+                    connection,
+                    $"CREATE DATABASE {QuoteIdentifier(backupDatabase)} WITH TEMPLATE {QuoteIdentifier(database)}",
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.InsufficientPrivilege or PostgresErrorCodes.ObjectInUse)
+            {
+                throw new NotSupportedException(
+                    $"Copying the database failed: {ex.MessageText}. Copying needs the CREATEDB privilege and no other connections to the database; "
+                    + $"set the {PostgresProviderOptions.MigrationBackupKey} option to false to stop trying.",
+                    ex);
+            }
         }
 
         return key;

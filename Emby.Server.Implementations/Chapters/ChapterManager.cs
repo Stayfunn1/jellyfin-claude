@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -151,7 +152,8 @@ public class ChapterManager : IChapterManager
                 break;
             }
 
-            var path = _pathManager.GetChapterImagePath(video, chapter.StartPositionTicks);
+            var path = FindSavedChapterImage(currentImages, video, chapter.StartPositionTicks)
+                ?? _pathManager.GetChapterImagePath(video, chapter.StartPositionTicks);
 
             if (!currentImages.Contains(path, StringComparison.OrdinalIgnoreCase))
             {
@@ -273,6 +275,39 @@ public class ChapterManager : IChapterManager
     public async Task DeleteChapterDataAsync(Guid itemId, CancellationToken cancellationToken)
     {
         await _chapterRepository.DeleteChaptersAsync(itemId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Finds the saved image of a chapter, allowing for the precision the item's modification date was stored with.
+    /// </summary>
+    /// <remarks>
+    /// The file name carries the modification date of the video in ticks. Databases such as PostgreSQL store dates to the
+    /// microsecond, so the date of a video read back from the database can differ from the one the image was named after
+    /// by less than a tick, which would otherwise extract every chapter image again.
+    /// </remarks>
+    private string? FindSavedChapterImage(IReadOnlyList<string> savedImages, Video video, long chapterPositionTicks)
+    {
+        var expected = Path.GetFileName(_pathManager.GetChapterImagePath(video, chapterPositionTicks).AsSpan());
+        var separator = expected.IndexOf('_');
+        if (separator < 0)
+        {
+            return null;
+        }
+
+        var suffix = expected[separator..];
+        foreach (var image in savedImages)
+        {
+            var name = Path.GetFileName(image.AsSpan());
+            if (name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+                && name.Length > suffix.Length
+                && long.TryParse(name[..^suffix.Length], NumberStyles.None, CultureInfo.InvariantCulture, out var ticks)
+                && Math.Abs(ticks - video.DateModified.Ticks) < TimeSpan.TicksPerSecond)
+            {
+                return image;
+            }
+        }
+
+        return null;
     }
 
     private IReadOnlyList<string> GetSavedChapterImages(Video video, IDirectoryService directoryService)
