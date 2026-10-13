@@ -101,33 +101,7 @@ internal class JellyfinMigrationService
         if (!serverConfig.IsStartupWizardCompleted || startupOptions.StartupMode is Configuration.StartupMode.SeedSystem)
         {
             logger.LogInformation("System initialization detected. Seed data. Startup mode is: {StartupMode}", startupOptions.StartupMode ?? Configuration.StartupMode.MediaServer);
-            var flatApplyMigrations = Migrations.SelectMany(e => e.Where(f => !f.Metadata.RunMigrationOnSetup)).ToArray();
-
-            var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
-            await using (dbContext.ConfigureAwait(false))
-            {
-                var databaseCreator = dbContext.Database.GetService<IDatabaseCreator>() as IRelationalDatabaseCreator
-                    ?? throw new InvalidOperationException("Jellyfin does only support relational databases.");
-                if (!await databaseCreator.ExistsAsync().ConfigureAwait(false))
-                {
-                    await databaseCreator.CreateAsync().ConfigureAwait(false);
-                }
-
-                var historyRepository = dbContext.GetService<IHistoryRepository>();
-
-                await historyRepository.CreateIfNotExistsAsync().ConfigureAwait(false);
-                var appliedMigrations = await dbContext.Database.GetAppliedMigrationsAsync().ConfigureAwait(false);
-                var startupScripts = flatApplyMigrations
-                    .Where(e => !appliedMigrations.Any(f => f != e.BuildCodeMigrationId()))
-                    .Select(e => (Migration: e.Metadata, Script: historyRepository.GetInsertScript(new HistoryRow(e.BuildCodeMigrationId(), GetJellyfinVersion()))))
-                    .ToArray();
-                foreach (var item in startupScripts)
-                {
-                    logger.LogInformation("Seed migration {Key}-{Name}.", item.Migration.Key, item.Migration.Name);
-                    await dbContext.Database.ExecuteSqlRawAsync(item.Script).ConfigureAwait(false);
-                }
-            }
-
+            await CreateAndSeedDatabaseAsync(logger).ConfigureAwait(false);
             logger.LogInformation("Migration system initialisation completed.");
         }
         else
@@ -138,6 +112,14 @@ internal class JellyfinMigrationService
             if (startupMode == Configuration.StartupMode.MediaServer && string.IsNullOrWhiteSpace(startupOptions.RestoreArchive))
             {
                 await EnsureExistingDatabaseAsync(appPaths, logger).ConfigureAwait(false);
+            }
+            else if (!string.IsNullOrWhiteSpace(startupOptions.RestoreArchive) && !await HasMigrationHistoryAsync().ConfigureAwait(false))
+            {
+                // A backup is restored into a database that does not exist yet, e.g. after moving the server to another
+                // database. The startup migrations need somewhere to record themselves before the restore replaces it;
+                // they are seeded as on a first start, since the configuration they would migrate is restored as well.
+                logger.LogInformation("Creating the database the backup is restored into.");
+                await CreateAndSeedDatabaseAsync(logger).ConfigureAwait(false);
             }
 
             // migrate any existing migration.xml files
@@ -188,6 +170,53 @@ internal class JellyfinMigrationService
                     throw;
                 }
             }
+        }
+    }
+
+    private async Task CreateAndSeedDatabaseAsync(IStartupLogger logger)
+    {
+        var flatApplyMigrations = Migrations.SelectMany(e => e.Where(f => !f.Metadata.RunMigrationOnSetup)).ToArray();
+        var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
+        await using (dbContext.ConfigureAwait(false))
+        {
+            var databaseCreator = dbContext.Database.GetService<IDatabaseCreator>() as IRelationalDatabaseCreator
+                ?? throw new InvalidOperationException("Jellyfin does only support relational databases.");
+            if (!await databaseCreator.ExistsAsync().ConfigureAwait(false))
+            {
+                await databaseCreator.CreateAsync().ConfigureAwait(false);
+            }
+
+            var historyRepository = dbContext.GetService<IHistoryRepository>();
+
+            await historyRepository.CreateIfNotExistsAsync().ConfigureAwait(false);
+            var appliedMigrations = await dbContext.Database.GetAppliedMigrationsAsync().ConfigureAwait(false);
+            var startupScripts = flatApplyMigrations
+                .Where(e => !appliedMigrations.Any(f => f != e.BuildCodeMigrationId()))
+                .Select(e => (Migration: e.Metadata, Script: historyRepository.GetInsertScript(new HistoryRow(e.BuildCodeMigrationId(), GetJellyfinVersion()))))
+                .ToArray();
+            foreach (var item in startupScripts)
+            {
+                logger.LogInformation("Seed migration {Key}-{Name}.", item.Migration.Key, item.Migration.Name);
+                await dbContext.Database.ExecuteSqlRawAsync(item.Script).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task<bool> HasMigrationHistoryAsync()
+    {
+        var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
+        await using (dbContext.ConfigureAwait(false))
+        {
+            var databaseCreator = dbContext.Database.GetService<IDatabaseCreator>() as IRelationalDatabaseCreator
+                ?? throw new InvalidOperationException("Jellyfin does only support relational databases.");
+            if (!await databaseCreator.ExistsAsync().ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            var historyRepository = dbContext.GetService<IHistoryRepository>();
+            return await historyRepository.ExistsAsync().ConfigureAwait(false)
+                && (await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false)).Count > 0;
         }
     }
 

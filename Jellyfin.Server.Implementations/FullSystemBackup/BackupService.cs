@@ -219,10 +219,11 @@ public class BackupService : IBackupService
             }
 
             // A server restored from scratch, e.g. one that was just pointed at a new database, has no tables to restore into.
+            // Its history may already list the startup migrations, but none of the schema migrations.
             var databaseCreator = (IRelationalDatabaseCreator)dbContext.GetService<IDatabaseCreator>();
             var hasSchema = await databaseCreator.ExistsAsync().ConfigureAwait(false)
                 && await historyRepository.ExistsAsync().ConfigureAwait(false)
-                && (await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false)).Count > 0;
+                && (await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false)).Any(e => ownMigrations.Contains(e.MigrationId));
             if (fromOtherProvider || !hasSchema)
             {
                 _logger.LogInformation("Bringing the database schema up to date before restoring into it");
