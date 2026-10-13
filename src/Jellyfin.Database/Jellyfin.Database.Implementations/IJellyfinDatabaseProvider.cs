@@ -93,4 +93,13 @@ public interface IJellyfinDatabaseProvider
     /// <param name="tableNames">The names of the tables to purge or null for all tables to be purged.</param>
     /// <returns>A Task.</returns>
     Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames);
+
+    /// <summary>
+    /// Brings the generated keys in line with rows that were written with explicit key values, e.g. by a restore or an
+    /// import, so that rows added afterwards do not collide with them.
+    /// </summary>
+    /// <param name="dbContext">The Database context.</param>
+    /// <param name="cancellationToken">A cancellation token.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    Task SynchronizeGeneratedKeys(JellyfinDbContext dbContext, CancellationToken cancellationToken) => Task.CompletedTask;
 }

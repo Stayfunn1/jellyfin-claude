@@ -1,4 +1,5 @@
 using System;
+using System.Data.Common;
 using System.Linq;
 using System.Threading.Tasks;
 using Emby.Server.Implementations.Data;
@@ -8,7 +9,6 @@ using MediaBrowser.Controller;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -122,15 +122,22 @@ public sealed class ItemValuesCleanupTests : SqliteDbTestFixture
             context.ItemValuesMap.Add(Map(item, value));
             context.ItemValues.Add(CreateValue("Already orphaned"));
             context.SaveChanges();
-            context.Database.ExecuteSqlRaw("""
-                CREATE TRIGGER FailItemValuesCleanup BEFORE DELETE ON ItemValues
-                BEGIN
-                    SELECT RAISE(ABORT, 'injected orphan cleanup failure');
-                END;
-                """);
+            context.Database.ExecuteSqlRaw(IsPostgres
+                ? """
+                    CREATE FUNCTION fail_item_values_cleanup() RETURNS trigger LANGUAGE plpgsql
+                        AS $$ BEGIN RAISE EXCEPTION 'injected orphan cleanup failure'; END $$;
+                    CREATE TRIGGER "FailItemValuesCleanup" BEFORE DELETE ON "ItemValues"
+                        FOR EACH ROW EXECUTE FUNCTION fail_item_values_cleanup();
+                    """
+                : """
+                    CREATE TRIGGER FailItemValuesCleanup BEFORE DELETE ON ItemValues
+                    BEGIN
+                        SELECT RAISE(ABORT, 'injected orphan cleanup failure');
+                    END;
+                    """);
         }
 
-        var exception = Assert.Throws<SqliteException>(() => _service.DeleteItem([item.Id]));
+        var exception = Assert.ThrowsAny<DbException>(() => _service.DeleteItem([item.Id]));
 
         Assert.Contains("injected orphan cleanup failure", exception.Message, StringComparison.Ordinal);
         using var after = CreateDbContext();
