@@ -1,4 +1,7 @@
 using System;
+using System.Data.Common;
+using System.Globalization;
+using System.Linq;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Npgsql;
 
@@ -59,20 +62,31 @@ public static class PostgresConnectionSettings
             }
         }
 
-        // Leave the libpq environment variables in charge when they are set, as Npgsql reads them for missing values.
-        if (string.IsNullOrEmpty(builder.Host) && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("PGHOST")))
+        // Settings database.xml leaves out come from the libpq environment variables, e.g. to keep the password out of
+        // the file. Npgsql only reads some of them itself.
+        if (string.IsNullOrEmpty(builder.Host))
         {
-            builder.Host = DefaultHost;
+            builder.Host = GetEnvironmentVariable("PGHOST") ?? DefaultHost;
         }
 
-        if (string.IsNullOrEmpty(builder.Username) && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("PGUSER")))
+        if (!HasOption(customOptions, "Port") && GetEnvironmentVariable("PGPORT") is { } port)
         {
-            builder.Username = DefaultName;
+            builder.Port = int.Parse(port, CultureInfo.InvariantCulture);
         }
 
         if (string.IsNullOrEmpty(builder.Database))
         {
-            builder.Database = Environment.GetEnvironmentVariable("PGDATABASE") is { Length: > 0 } database ? database : DefaultName;
+            builder.Database = GetEnvironmentVariable("PGDATABASE") ?? DefaultName;
+        }
+
+        if (string.IsNullOrEmpty(builder.Username))
+        {
+            builder.Username = GetEnvironmentVariable("PGUSER") ?? DefaultName;
+        }
+
+        if (string.IsNullOrEmpty(builder.Password) && GetEnvironmentVariable("PGPASSWORD") is { } password)
+        {
+            builder.Password = password;
         }
 
         if (string.IsNullOrEmpty(builder.ApplicationName))
@@ -99,6 +113,22 @@ public static class PostgresConnectionSettings
         }
 
         return redacted.ConnectionString;
+    }
+
+    private static string? GetEnvironmentVariable(string name)
+        => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : null;
+
+    private static bool HasOption(CustomDatabaseOptions? customOptions, string keyword)
+    {
+        if (customOptions is null)
+        {
+            return false;
+        }
+
+        // NpgsqlConnectionStringBuilder answers ContainsKey for every keyword it knows, set or not.
+        var fromConnectionString = new DbConnectionStringBuilder { ConnectionString = customOptions.ConnectionString ?? string.Empty };
+        return fromConnectionString.ContainsKey(keyword)
+            || customOptions.Options.Any(e => e.Key.Equals(keyword, StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool ParseBool(string key, string value)
